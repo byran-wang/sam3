@@ -72,6 +72,7 @@ def abs_to_rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
 def save_obj_id_masks(outputs_per_frame, output_dir, video_frames_for_vis, obj_id=0):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = get_mask_output_paths(video_frames_for_vis, output_dir)
     fallback_shape = None
     for frame_outputs in outputs_per_frame.values():
         if obj_id in frame_outputs:
@@ -87,8 +88,19 @@ def save_obj_id_masks(outputs_per_frame, output_dir, video_frames_for_vis, obj_i
             mask_to_save = np.zeros(fallback_shape, dtype=np.uint8)
         else:
             mask_to_save = (mask.astype(np.uint8) * 255)
-        out_path = output_dir / f"{frame_idx:04d}.png"
+        out_path = output_paths[frame_idx]
         cv2.imwrite(str(out_path), mask_to_save)
+
+
+def get_mask_output_paths(video_frames_for_vis, output_dir):
+    output_dir = Path(output_dir)
+    output_paths = []
+    for idx, frame in enumerate(video_frames_for_vis):
+        if isinstance(frame, (str, Path)):
+            output_paths.append(output_dir / f"{Path(frame).stem}.png")
+        else:
+            output_paths.append(output_dir / f"{idx:04d}.png")
+    return output_paths
 
 
 def ensure_cached_frame_outputs(predictor, session_id):
@@ -222,6 +234,11 @@ def main(args):
                 f"falling back to lexicographic sort."
             )
             video_frames_for_vis.sort()
+
+    expected_mask_paths = get_mask_output_paths(video_frames_for_vis, out_path)
+    if expected_mask_paths and all(p.exists() for p in expected_mask_paths):
+        print(f"Masks already exist in {out_path}, skipping {video_path}")
+        return
 
     response = predictor.handle_request(
     request=dict(
