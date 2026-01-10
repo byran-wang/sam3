@@ -2,6 +2,11 @@ import os
 import sam3
 import torch
 from sam3.model_builder import build_sam3_video_predictor
+from sam3.visualization_utils import (
+    load_frame,
+    prepare_masks_for_visualization,
+    visualize_formatted_frame_output,
+)
 
 import glob
 import os
@@ -86,12 +91,89 @@ def save_obj_id_masks(outputs_per_frame, output_dir, video_frames_for_vis, obj_i
         cv2.imwrite(str(out_path), mask_to_save)
 
 
+def ensure_cached_frame_outputs(predictor, session_id):
+    session = predictor._get_session(session_id)
+    inference_state = session["state"]
+    cached_outputs = inference_state.setdefault("cached_frame_outputs", {})
+    for frame_idx in range(inference_state["num_frames"]):
+        cached_outputs.setdefault(frame_idx, {})
+
+
+def collect_points_with_labels(image, title=None):
+    points_abs = []
+    labels = []
+    fig, ax = plt.subplots()
+    ax.imshow(image)
+    ax.set_title(
+        title
+        or "Left click: positive (1), right click: negative (0). Press Enter to finish."
+    )
+    ax.axis("off")
+
+    def _on_click(event):
+        if event.inaxes != ax:
+            return
+        if event.button == 1:
+            label = 1
+            color = "lime"
+        elif event.button == 3:
+            label = 0
+            color = "red"
+        else:
+            return
+        points_abs.append([event.xdata, event.ydata])
+        labels.append(label)
+        ax.scatter([event.xdata], [event.ydata], c=color, s=30, marker="o")
+        fig.canvas.draw_idle()
+
+    def _on_key(event):
+        if event.key == "enter":
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("button_press_event", _on_click)
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    plt.show()
+    return points_abs, labels
+
+
+def try_point_prompt(
+    predictor,
+    session_id,
+    frame_idx,
+    video_frames_for_vis,
+    use_point_prompt_when_no_obj_detected,
+):
+    if not use_point_prompt_when_no_obj_detected:
+        return None, False, False
+    obj_id = 0
+    frame_for_prompt = load_frame(video_frames_for_vis[frame_idx])
+    IMG_HEIGHT, IMG_WIDTH = frame_for_prompt.shape[:2]
+    points_abs, labels = collect_points_with_labels(frame_for_prompt)
+    if not points_abs:
+        return None, True, False
+    points_tensor = torch.tensor(
+        abs_to_rel_coords(points_abs, IMG_WIDTH, IMG_HEIGHT, coord_type="point"),
+        dtype=torch.float32,
+    )
+    points_labels_tensor = torch.tensor(labels, dtype=torch.int32)
+
+    response = predictor.handle_request(
+        request=dict(
+            type="add_prompt",
+            session_id=session_id,
+            frame_index=frame_idx,
+            points=points_tensor,
+            point_labels=points_labels_tensor,
+            obj_id=obj_id,
+        )
+    )
+    return response["outputs"], False, True
+
+
 def main(args):
     video_path = args.video_path 
     out_path = args.out_path 
     scene_name = Path(video_path).parents[0].name
-    #TODO: obj name is the first part of the scene name without the number, e.g. scene_name="ABF10", obj_name="ABF"
-    # TODO: obj name is the first part of the scene name without the number, e.g. scene_name="ABF10", obj_name="ABF"
 
     obj_name = scene_name.rstrip("0123456789")
 
@@ -110,12 +192,6 @@ def main(args):
     checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
     predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
     
-    from sam3.visualization_utils import (
-        load_frame,
-        prepare_masks_for_visualization,
-        visualize_formatted_frame_output,
-    )
-
 
     # font size for axes titles
     plt.rcParams["axes.titlesize"] = 12
@@ -177,15 +253,37 @@ def main(args):
     out = response["outputs"]
 
     plt.close("all")
-    # visualize_formatted_frame_output(
-    #     frame_idx,
-    #     video_frames_for_vis,
-    #     outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
-    #     titles=["SAM 3 Dense Tracking outputs"],
-    #     figsize=(6, 4),
-    # )
+
+    used_point_prompt = False
+    if len(out['out_obj_ids']) == 0:
+        print(f"No objects detected from the text prompt {prompt_text_str}")
+        out, should_skip, used_point_prompt = try_point_prompt(
+            predictor,
+            session_id,
+            frame_idx,
+            video_frames_for_vis,
+            args.use_point_prompt_when_no_obj_detected,
+        )
+        if should_skip:
+            print("No points selected, skipping the video.")
+            return
+        if out is None:
+            print(f"Skipping the video {video_path} and there is no object detected for the point prompt")
+            return
+    else:
+        print(f"{len(out['out_obj_ids'])} objects detected from the text prompt {prompt_text_str}")
+    if args.show_detected_obj:
+        visualize_formatted_frame_output(
+            frame_idx,
+            video_frames_for_vis,
+            outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
+            titles=["SAM 3 Dense Tracking outputs"],
+            figsize=(6, 4),
+        )
 
     # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
+    if used_point_prompt:
+        ensure_cached_frame_outputs(predictor, session_id)
     outputs_per_frame = propagate_in_video(predictor, session_id)
 
     # finally, we reformat the outputs for visualization and plot the outputs every 60 frames
@@ -193,45 +291,8 @@ def main(args):
 
     plt.close("all")
 
-    save_obj_id_masks(outputs_per_frame, args.out_path, video_frames_for_vis, obj_id=0)
+    save_obj_id_masks(outputs_per_frame, out_path, video_frames_for_vis, obj_id=0)
 
-    # vis_frame_stride = 60
-    # for frame_idx in range(0, len(outputs_per_frame), vis_frame_stride):
-    #     visualize_formatted_frame_output(
-    #         frame_idx,
-    #         video_frames_for_vis,
-    #         outputs_list=[outputs_per_frame],
-    #         titles=["SAM 3 Dense Tracking outputs"],
-    #         figsize=(6, 4),
-    #     )
-
-
-    # # we pick id 2, which is the dancer in the front
-    # obj_id = 1
-    # response = predictor.handle_request(
-    #     request=dict(
-    #         type="remove_object",
-    #         session_id=session_id,
-    #         obj_id=obj_id,
-    #     )
-    # )
-
-    # # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
-    # outputs_per_frame = propagate_in_video(predictor, session_id)
-
-    # # finally, we reformat the outputs for visualization and plot the outputs every 60 frames
-    # outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
-
-    # vis_frame_stride = 60
-    # plt.close("all")
-    # for frame_idx in range(0, len(outputs_per_frame), vis_frame_stride):
-    #     visualize_formatted_frame_output(
-    #         frame_idx,
-    #         video_frames_for_vis,
-    #         outputs_list=[outputs_per_frame],
-    #         titles=["SAM 3 Dense Tracking outputs"],
-    #         figsize=(6, 4),
-    #     )
 
 if __name__ == "__main__":
     import argparse
@@ -239,6 +300,8 @@ if __name__ == "__main__":
     parser.add_argument("--video_path", type=str, default="/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/rgb/")
     parser.add_argument("--out_path", type=str, default="/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/mask_hand/")
     parser.add_argument("--text_prompt", type=str, default="right hand")
+    parser.add_argument("--use_point_prompt_when_no_obj_detected", type=int, default=1)
+    parser.add_argument("--show_detected_obj", type=int, default=0)
 
     args = parser.parse_args()
     main(args)
