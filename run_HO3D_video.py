@@ -177,13 +177,13 @@ def main(args):
     out = response["outputs"]
 
     plt.close("all")
-    visualize_formatted_frame_output(
-        frame_idx,
-        video_frames_for_vis,
-        outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
-        titles=["SAM 3 Dense Tracking outputs"],
-        figsize=(6, 4),
-    )
+    # visualize_formatted_frame_output(
+    #     frame_idx,
+    #     video_frames_for_vis,
+    #     outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
+    #     titles=["SAM 3 Dense Tracking outputs"],
+    #     figsize=(6, 4),
+    # )
 
     # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
     outputs_per_frame = propagate_in_video(predictor, session_id)
