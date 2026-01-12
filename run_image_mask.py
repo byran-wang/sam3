@@ -77,9 +77,13 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
     ax.imshow(image)
     mask_artist = ax.imshow(np.zeros(image.shape[:2]), cmap="jet", alpha=0.0)
     contour_artist = None
+    point_artists = []
     ax.set_title(
         title
-        or "Left click: positive (1), right click: negative (0). Press Enter to finish."
+        or (
+            "Left click: positive (1), right click: negative (0), "
+            "middle click: reset. Press Enter to finish."
+        )
     )
     ax.axis("off")
 
@@ -117,6 +121,14 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
     def _on_click(event):
         if event.inaxes != ax:
             return
+        if event.button == 2:
+            points_abs.clear()
+            labels.clear()
+            for artist in point_artists:
+                artist.remove()
+            point_artists.clear()
+            _refresh_mask()
+            return
         if event.button == 1:
             label = 1
             color = "lime"
@@ -127,7 +139,8 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
             return
         points_abs.append([event.xdata, event.ydata])
         labels.append(label)
-        ax.scatter([event.xdata], [event.ydata], c=color, s=30, marker="o")
+        artist = ax.scatter([event.xdata], [event.ydata], c=color, s=30, marker="o")
+        point_artists.append(artist)
         _refresh_mask()
 
     def _on_key(event):
