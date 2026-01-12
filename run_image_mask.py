@@ -70,6 +70,76 @@ def collect_points_with_labels(image, title=None):
     return points_abs, labels
 
 
+def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
+    points_abs = []
+    labels = []
+    fig, ax = plt.subplots()
+    ax.imshow(image)
+    mask_artist = ax.imshow(np.zeros(image.shape[:2]), cmap="jet", alpha=0.0)
+    contour_artist = None
+    ax.set_title(
+        title
+        or "Left click: positive (1), right click: negative (0). Press Enter to finish."
+    )
+    ax.axis("off")
+
+    def _refresh_mask():
+        nonlocal contour_artist
+        if not points_abs:
+            mask_artist.set_data(np.zeros(image.shape[:2]))
+            if contour_artist is not None:
+                if hasattr(contour_artist, "collections"):
+                    for c in contour_artist.collections:
+                        c.remove()
+                else:
+                    contour_artist.remove()
+                contour_artist = None
+            fig.canvas.draw_idle()
+            return
+        mask = predict_mask_fn(points_abs, labels)
+        if mask is None:
+            return
+        mask_artist.set_data(mask)
+        if contour_artist is not None:
+            if hasattr(contour_artist, "collections"):
+                for c in contour_artist.collections:
+                    c.remove()
+            else:
+                contour_artist.remove()
+        contour_artist = ax.contour(
+            mask.astype(np.float32),
+            levels=[0.5],
+            colors="cyan",
+            linewidths=1.5,
+        )
+        fig.canvas.draw_idle()
+
+    def _on_click(event):
+        if event.inaxes != ax:
+            return
+        if event.button == 1:
+            label = 1
+            color = "lime"
+        elif event.button == 3:
+            label = 0
+            color = "red"
+        else:
+            return
+        points_abs.append([event.xdata, event.ydata])
+        labels.append(label)
+        ax.scatter([event.xdata], [event.ydata], c=color, s=30, marker="o")
+        _refresh_mask()
+
+    def _on_key(event):
+        if event.key == "enter":
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("button_press_event", _on_click)
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    plt.show()
+    return points_abs, labels
+
+
 def main(args):
     image_path = args.image_path
     out_path = resolve_output_path(args.out_path, image_path)
@@ -90,7 +160,24 @@ def main(args):
     if args.point_coords and args.point_labels:
         point_coords, point_labels = parse_points(args.point_coords, args.point_labels)
     else:
-        points_abs, labels = collect_points_with_labels(np.array(image))
+        def _predict_mask(points_abs, labels):
+            point_coords = np.array(points_abs, dtype=np.float32)
+            point_labels = np.array(labels, dtype=np.int32)
+            masks, scores, _ = model.predict_inst(
+                inference_state,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=args.multimask_output,
+            )
+            if masks is None or len(masks) == 0:
+                return None
+            best_idx = int(np.argmax(scores))
+            return masks[best_idx].astype(np.uint8)
+
+        points_abs, labels = collect_points_with_labels_with_preview(
+            np.array(image),
+            _predict_mask,
+        )
         if not points_abs:
             raise RuntimeError("No points selected.")
         point_coords = np.array(points_abs, dtype=np.float32)
