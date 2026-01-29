@@ -18,24 +18,6 @@ from PIL import Image
 from pathlib import Path
 
 
-obj2text_prompt = {
-    'AP': 'blue pitcher base',
-    'MPM': 'potted meatal can',
-    'SB': 'white clean bleach',
-    'SM': 'yellow mustard bottle',
-    "ABF": "white clean bleach",
-    "BB": "yello banana",
-    "GPMF": "potted meatal can",
-    "GSF": "scissors",
-    "MC": "red cracker_box",
-    "MDF": "orange power drill",
-    "ND": "orange power drill",
-    "SMu": "red mug",
-    "SS": "yellow sugar box",
-    "ShSu": "yellow sugar box",
-    "SiBF": "yellow banana",
-    "SiS": "yellow sugar box",         
-}
 
 def propagate_in_video(predictor, session_id):
     # we will just propagate from frame 0 to the end of the video
@@ -185,11 +167,6 @@ def try_point_prompt(
 def main(args):
     video_path = args.video_path 
     out_path = args.out_path 
-    scene_name = Path(video_path).parents[0].name
-
-    obj_name = scene_name.rstrip("0123456789")
-
-    prompt_text_str = obj2text_prompt[obj_name]
 
 
     # TODO if there is no .mp4 file, convert all the image files to a mp4 file
