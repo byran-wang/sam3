@@ -251,6 +251,7 @@ def main(args):
     used_point_prompt = False
     if len(out['out_obj_ids']) == 0:
         print(f"No objects detected from the text prompt {prompt_text_str}")
+        ensure_cached_frame_outputs(predictor, session_id)
         out, should_skip, used_point_prompt = try_point_prompt(
             predictor,
             session_id,
@@ -266,6 +267,19 @@ def main(args):
             return
     else:
         print(f"{len(out['out_obj_ids'])} objects detected from the text prompt {prompt_text_str}")
+        # Optionally add point prompts on top of text detection
+        if args.use_both_text_and_point_prompt:
+            print("Adding point prompts to refine/extend the text detection...")
+            ensure_cached_frame_outputs(predictor, session_id)
+            point_out, should_skip, used_point_prompt = try_point_prompt(
+                predictor,
+                session_id,
+                frame_idx,
+                video_frames_for_vis,
+                use_point_prompt_when_no_obj_detected=True,
+            )
+            if not should_skip and point_out is not None:
+                out = point_out  # Use the updated output with point prompts
     if args.show_detected_obj:
         visualize_formatted_frame_output(
             frame_idx,
@@ -276,8 +290,6 @@ def main(args):
         )
 
     # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
-    if used_point_prompt:
-        ensure_cached_frame_outputs(predictor, session_id)
     outputs_per_frame = propagate_in_video(predictor, session_id)
 
     # finally, we reformat the outputs for visualization and plot the outputs every 60 frames
@@ -295,6 +307,8 @@ if __name__ == "__main__":
     parser.add_argument("--out_path", type=str, default="/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/mask_hand/")
     parser.add_argument("--text_prompt", type=str, default="right hand")
     parser.add_argument("--use_point_prompt_when_no_obj_detected", type=int, default=1)
+    parser.add_argument("--use_both_text_and_point_prompt", type=int, default=0,
+                        help="If 1, use both text prompt and point prompt together")
     parser.add_argument("--show_detected_obj", type=int, default=0)
 
     args = parser.parse_args()
