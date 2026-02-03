@@ -73,23 +73,29 @@ def collect_points_with_labels(image, title=None):
 def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
     points_abs = []
     labels = []
+    box_coords = [None]  # [x1, y1, x2, y2] or None
     fig, ax = plt.subplots()
     ax.imshow(image)
     mask_artist = ax.imshow(np.zeros(image.shape[:2]), cmap="jet", alpha=0.0)
     contour_artist = None
     point_artists = []
-    ax.set_title(
-        title
-        or (
-            "Left click: positive (1), right click: negative (0), "
-            "middle click: reset. Press Enter to finish."
-        )
+    box_artist = [None]  # Rectangle patch for bbox
+    drag_start = [None]  # Starting point for bbox drag
+
+    tips = (
+        "Tips:\n"
+        "  Left click: add positive point (+)\n"
+        "  Right click: add negative point (-)\n"
+        "  Shift + drag: draw bounding box\n"
+        "  Middle click: reset all\n"
+        "  Enter: finish and save"
     )
+    ax.set_title(title or tips)
     ax.axis("off")
 
     def _refresh_mask():
         nonlocal contour_artist
-        if not points_abs:
+        if not points_abs and box_coords[0] is None:
             mask_artist.set_data(np.zeros(image.shape[:2]))
             if contour_artist is not None:
                 if hasattr(contour_artist, "collections"):
@@ -100,7 +106,7 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
                 contour_artist = None
             fig.canvas.draw_idle()
             return
-        mask = predict_mask_fn(points_abs, labels)
+        mask = predict_mask_fn(points_abs, labels, box_coords[0])
         if mask is None:
             return
         mask_artist.set_data(mask)
@@ -118,16 +124,32 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
         )
         fig.canvas.draw_idle()
 
-    def _on_click(event):
+    def _clear_box():
+        if box_artist[0] is not None:
+            box_artist[0].remove()
+            box_artist[0] = None
+        box_coords[0] = None
+
+    def _on_press(event):
         if event.inaxes != ax:
             return
+        # Shift + left click starts bbox drawing
+        if event.button == 1 and event.key == "shift":
+            drag_start[0] = (event.xdata, event.ydata)
+            _clear_box()
+            return
+        # Middle click resets all
         if event.button == 2:
             points_abs.clear()
             labels.clear()
             for artist in point_artists:
                 artist.remove()
             point_artists.clear()
+            _clear_box()
             _refresh_mask()
+            return
+        # Normal left/right click for points (only if not shift)
+        if event.key == "shift":
             return
         if event.button == 1:
             label = 1
@@ -143,14 +165,42 @@ def collect_points_with_labels_with_preview(image, predict_mask_fn, title=None):
         point_artists.append(artist)
         _refresh_mask()
 
+    def _on_motion(event):
+        if drag_start[0] is None or event.inaxes != ax:
+            return
+        x0, y0 = drag_start[0]
+        x1, y1 = event.xdata, event.ydata
+        if box_artist[0] is not None:
+            box_artist[0].remove()
+        from matplotlib.patches import Rectangle
+        width = x1 - x0
+        height = y1 - y0
+        box_artist[0] = ax.add_patch(
+            Rectangle((x0, y0), width, height, fill=False, edgecolor="yellow", linewidth=2)
+        )
+        fig.canvas.draw_idle()
+
+    def _on_release(event):
+        if drag_start[0] is None or event.inaxes != ax:
+            drag_start[0] = None
+            return
+        x0, y0 = drag_start[0]
+        x1, y1 = event.xdata, event.ydata
+        drag_start[0] = None
+        # Normalize coordinates (ensure x1 > x0 and y1 > y0)
+        box_coords[0] = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+        _refresh_mask()
+
     def _on_key(event):
         if event.key == "enter":
             plt.close(fig)
 
-    fig.canvas.mpl_connect("button_press_event", _on_click)
+    fig.canvas.mpl_connect("button_press_event", _on_press)
+    fig.canvas.mpl_connect("motion_notify_event", _on_motion)
+    fig.canvas.mpl_connect("button_release_event", _on_release)
     fig.canvas.mpl_connect("key_press_event", _on_key)
     plt.show()
-    return points_abs, labels
+    return points_abs, labels, box_coords[0]
 
 
 def main(args):
@@ -170,16 +220,23 @@ def main(args):
     processor = Sam3Processor(model, device=device)
     inference_state = processor.set_image(image)
 
+    box = None
     if args.point_coords and args.point_labels:
         point_coords, point_labels = parse_points(args.point_coords, args.point_labels)
+        if args.box_coords:
+            if len(args.box_coords) != 4:
+                raise ValueError("box_coords must be x1 y1 x2 y2")
+            box = np.array(args.box_coords, dtype=np.float32)
     else:
-        def _predict_mask(points_abs, labels):
-            point_coords = np.array(points_abs, dtype=np.float32)
-            point_labels = np.array(labels, dtype=np.int32)
+        def _predict_mask(points_abs, labels, box_coords=None):
+            point_coords = np.array(points_abs, dtype=np.float32) if points_abs else None
+            point_labels = np.array(labels, dtype=np.int32) if labels else None
+            box_arr = np.array(box_coords, dtype=np.float32) if box_coords else None
             masks, scores, _ = model.predict_inst(
                 inference_state,
                 point_coords=point_coords,
                 point_labels=point_labels,
+                box=box_arr,
                 multimask_output=args.multimask_output,
             )
             if masks is None or len(masks) == 0:
@@ -187,18 +244,20 @@ def main(args):
             best_idx = int(np.argmax(scores))
             return masks[best_idx].astype(np.uint8)
 
-        points_abs, labels = collect_points_with_labels_with_preview(
+        points_abs, labels, box_coords = collect_points_with_labels_with_preview(
             np.array(image),
             _predict_mask,
         )
-        if not points_abs:
-            raise RuntimeError("No points selected.")
-        point_coords = np.array(points_abs, dtype=np.float32)
-        point_labels = np.array(labels, dtype=np.int32)
+        if not points_abs and box_coords is None:
+            raise RuntimeError("No points or box selected.")
+        point_coords = np.array(points_abs, dtype=np.float32) if points_abs else None
+        point_labels = np.array(labels, dtype=np.int32) if labels else None
+        box = np.array(box_coords, dtype=np.float32) if box_coords else None
     masks, scores, _ = model.predict_inst(
         inference_state,
         point_coords=point_coords,
         point_labels=point_labels,
+        box=box,
         multimask_output=args.multimask_output,
     )
     if masks is None or len(masks) == 0:
@@ -218,5 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("--multimask_output", type=int, default=1)
     parser.add_argument("--point_coords", type=float, nargs="*", default=None)
     parser.add_argument("--point_labels", type=int, nargs="*", default=None)
+    parser.add_argument("--box_coords", type=float, nargs=4, default=None,
+                        help="Bounding box coordinates: x1 y1 x2 y2")
     args = parser.parse_args()
     main(args)
