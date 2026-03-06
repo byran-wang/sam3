@@ -624,6 +624,10 @@ def main(args):
         or out is None
         or len(out["out_obj_ids"]) == 0
     )
+    final_text_prompt = prompt_text_str
+    final_points = prompt_points
+    final_point_labels = prompt_point_labels
+    final_box = prompt_box
     if need_prompt_popup:
         prompt_state = collect_prompts_with_live_preview(
             predictor,
@@ -646,6 +650,10 @@ def main(args):
             prompt_state["labels"],
             prompt_state["box"],
         )
+        final_text_prompt = prompt_state["text"]
+        final_points = prompt_state["points"]
+        final_point_labels = prompt_state["labels"]
+        final_box = prompt_state["box"]
     else:
         print(
             "Mask detected with input prompt, skipping prompt window. "
@@ -662,6 +670,12 @@ def main(args):
             titles=["SAM 3 Dense Tracking outputs"],
             figsize=(6, 4),
         )
+
+    print("Prompts before propagate_in_video:")
+    print(f"  text_prompt: {final_text_prompt!r}")
+    print(f"  point_coords: {final_points}")
+    print(f"  point_labels: {final_point_labels}")
+    print(f"  box_coords: {final_box}")
 
     # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
     outputs_per_frame = propagate_in_video(predictor, session_id, start_frame_idx=frame_idx)
