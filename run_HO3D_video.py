@@ -1,3 +1,4 @@
+import json
 import os
 import sam3
 import torch
@@ -18,6 +19,37 @@ from PIL import Image
 from pathlib import Path
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import TextBox
+
+
+def save_prompt_to_file(prompt_file, text, points, labels, box):
+    """Persist a (text, points, labels, box) prompt bundle as JSON."""
+    data = {
+        "text": text if text is not None else "",
+        "points": [[float(x), float(y)] for x, y in (points or [])],
+        "labels": [int(v) for v in (labels or [])],
+        "box": None if box is None else [float(v) for v in box],
+    }
+    Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
+    with open(prompt_file, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved prompt to {prompt_file}")
+
+
+def load_prompt_from_file(prompt_file):
+    """Load a prompt JSON saved by ``save_prompt_to_file``. Returns a dict or None."""
+    if prompt_file is None or not os.path.exists(prompt_file):
+        return None
+    with open(prompt_file, "r") as f:
+        data = json.load(f)
+    text = data.get("text") or None
+    if isinstance(text, str) and text.strip().lower() in {"", "none", "null"}:
+        text = None
+    return {
+        "text": text,
+        "points": [[float(x), float(y)] for x, y in data.get("points", [])],
+        "labels": [int(v) for v in data.get("labels", [])],
+        "box": data.get("box"),
+    }
 
 
 def parse_points(point_coords, point_labels):
@@ -315,6 +347,153 @@ def _run_prompt_on_first_frame(
     return out
 
 
+def collect_prompts_no_preview(
+    frame_for_prompt,
+    *,
+    title=None,
+    initial_text=None,
+    initial_points=None,
+    initial_labels=None,
+    initial_box=None,
+):
+    """Lightweight prompt collector (no live mask preview, no predictor required).
+
+    Supports a text prompt, positive/negative click points, and a bounding box.
+    Returns {"text", "points", "labels", "box"}.
+    """
+    state = {
+        "text": "" if initial_text is None else str(initial_text),
+        "points": [list(p) for p in (initial_points or [])],
+        "labels": [int(v) for v in (initial_labels or [])],
+        "box": None if initial_box is None else list(initial_box),
+    }
+    drag_start = [None]
+    point_artists = []
+    box_artist = [None]
+
+    fig, ax = plt.subplots()
+    ax.imshow(frame_for_prompt)
+    tips = (
+        "Left click: positive (+)\n"
+        "Right click: negative (-)\n"
+        "Shift + drag: draw box\n"
+        "Middle click: clear all\n"
+        "Enter: save & close"
+    )
+    ax.set_title(f"{title}\n{tips}" if title else tips)
+    ax.axis("off")
+
+    text_ax = fig.add_axes([0.1, 0.02, 0.8, 0.05])
+    text_box = TextBox(text_ax, "Text")
+    text_box.set_val(state["text"])
+
+    def _clear_box():
+        state["box"] = None
+        if box_artist[0] is not None:
+            box_artist[0].remove()
+            box_artist[0] = None
+
+    def _draw_box(box_xyxy):
+        if box_xyxy is None:
+            return
+        x1, y1, x2, y2 = box_xyxy
+        if box_artist[0] is not None:
+            box_artist[0].remove()
+        box_artist[0] = ax.add_patch(
+            Rectangle(
+                (min(x1, x2), min(y1, y2)),
+                abs(x2 - x1),
+                abs(y2 - y1),
+                fill=False,
+                edgecolor="yellow",
+                linewidth=2,
+            )
+        )
+
+    def _clear_all():
+        state["points"].clear()
+        state["labels"].clear()
+        for artist in point_artists:
+            artist.remove()
+        point_artists.clear()
+        _clear_box()
+        state["text"] = ""
+        text_box.set_val("")
+
+    def _on_submit(text):
+        state["text"] = text.strip()
+
+    text_box.on_submit(_on_submit)
+
+    def _on_press(event):
+        if event.inaxes != ax:
+            return
+        if event.button == 1 and event.key == "shift":
+            drag_start[0] = (event.xdata, event.ydata)
+            _clear_box()
+            return
+        if event.button == 2:
+            _clear_all()
+            fig.canvas.draw_idle()
+            return
+        if event.key == "shift":
+            return
+        if event.button == 1:
+            label, color = 1, "lime"
+        elif event.button == 3:
+            label, color = 0, "red"
+        else:
+            return
+        state["points"].append([event.xdata, event.ydata])
+        state["labels"].append(label)
+        point_artists.append(ax.scatter([event.xdata], [event.ydata], c=color, s=30, marker="o"))
+        fig.canvas.draw_idle()
+
+    def _on_motion(event):
+        if drag_start[0] is None or event.inaxes != ax:
+            return
+        x0, y0 = drag_start[0]
+        x1, y1 = event.xdata, event.ydata
+        _draw_box([x0, y0, x1, y1])
+        fig.canvas.draw_idle()
+
+    def _on_release(event):
+        if drag_start[0] is None:
+            return
+        if event.inaxes != ax:
+            drag_start[0] = None
+            return
+        x0, y0 = drag_start[0]
+        x1, y1 = event.xdata, event.ydata
+        drag_start[0] = None
+        state["box"] = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+        _draw_box(state["box"])
+        fig.canvas.draw_idle()
+
+    def _on_key(event):
+        if event.key == "backspace" and state["points"]:
+            state["points"].pop()
+            state["labels"].pop()
+            point_artists[-1].remove()
+            point_artists.pop()
+            fig.canvas.draw_idle()
+        if event.key == "enter":
+            state["text"] = text_box.text.strip()
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("button_press_event", _on_press)
+    fig.canvas.mpl_connect("motion_notify_event", _on_motion)
+    fig.canvas.mpl_connect("button_release_event", _on_release)
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+
+    for p, l in zip(state["points"], state["labels"]):
+        color = "lime" if int(l) == 1 else "red"
+        point_artists.append(ax.scatter([p[0]], [p[1]], c=color, s=30, marker="o"))
+    _draw_box(state["box"])
+    plt.show()
+    return state
+
+
 def collect_prompts_with_live_preview(
     predictor,
     session_id,
@@ -324,6 +503,7 @@ def collect_prompts_with_live_preview(
     initial_points=None,
     initial_labels=None,
     initial_box=None,
+    title=None,
 ):
     img_h, img_w = frame_for_prompt.shape[:2]
     state = {
@@ -360,7 +540,7 @@ def collect_prompts_with_live_preview(
         "  Enter: finish and save\n"
         "  Text prompt: edit in the Text box below"
     )
-    ax.set_title(tips)
+    ax.set_title(f"{title} {tips}" if title else tips)
     ax.axis("off")
 
     text_ax = fig.add_axes([0.1, 0.02, 0.8, 0.05])
@@ -528,9 +708,127 @@ def collect_prompts_with_live_preview(
     return state
 
 
+def _first_frame_path(video_path):
+    """Return the path to the first image frame under ``video_path`` (or the mp4 itself)."""
+    if isinstance(video_path, str) and video_path.endswith(".mp4"):
+        return video_path
+    frames = glob.glob(os.path.join(video_path, "*.jpg"))
+    if not frames:
+        raise FileNotFoundError(f"No .jpg frames found under {video_path}")
+    try:
+        frames.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+    except ValueError:
+        frames.sort()
+    return frames[0]
+
+
+def _make_single_frame_session_dir(first_path):
+    """Create a temp directory containing only the first frame, so the SAM3
+    session only has to load a single image. Returns the temp dir path.
+    """
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="sam3_prompt_only_")
+    suffix = Path(first_path).suffix or ".jpg"
+    dst = Path(tmp_dir) / f"0000{suffix}"
+    try:
+        os.symlink(os.path.abspath(first_path), dst)
+    except OSError:
+        shutil.copyfile(first_path, dst)
+    return tmp_dir
+
+
+def _run_prompt_only(args):
+    """--prompt_only: load only the first image, spin up a lightweight SAM3
+    session on just that frame so the popup can show the live mask preview,
+    save the prompt, and exit without running propagation."""
+    first_path = _first_frame_path(args.video_path)
+
+    if first_path.endswith(".mp4"):
+        cap = cv2.VideoCapture(first_path)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            raise RuntimeError(f"Could not read first frame from {first_path}")
+        frame_for_prompt = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Save the first frame to a temp image so the SAM3 session can load it.
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="sam3_prompt_only_")
+        first_img_path = Path(tmp_dir) / "0000.jpg"
+        Image.fromarray(frame_for_prompt).save(first_img_path)
+        session_dir = tmp_dir
+    else:
+        frame_for_prompt = load_frame(first_path)
+        session_dir = _make_single_frame_session_dir(first_path)
+
+    initial_text = args.text_prompt
+    if initial_text is not None and str(initial_text).strip().lower() in {"", "none", "null"}:
+        initial_text = None
+    initial_points = []
+    initial_labels = []
+    if args.point_coords is not None or args.point_labels is not None:
+        if args.point_coords is None or args.point_labels is None:
+            raise ValueError("Please provide both --point_coords and --point_labels together.")
+        initial_points, initial_labels = parse_points(args.point_coords, args.point_labels)
+    initial_box = [float(v) for v in args.box_coords] if args.box_coords is not None else None
+
+    # Override with an existing prompt file when available.
+    loaded_prompt = load_prompt_from_file(args.prompt_file)
+    if loaded_prompt is not None:
+        print(f"Loaded prompt from {args.prompt_file}")
+        initial_text = loaded_prompt["text"] if loaded_prompt["text"] is not None else initial_text
+        if loaded_prompt["points"]:
+            initial_points = loaded_prompt["points"]
+            initial_labels = loaded_prompt["labels"]
+        if loaded_prompt["box"] is not None:
+            initial_box = loaded_prompt["box"]
+
+    # Build the SAM3 predictor and start a session on the single-frame dir.
+    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "../")
+    checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
+    gpus_to_use = range(torch.cuda.device_count())
+    predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
+    response = predictor.handle_request(
+        request=dict(type="start_session", resource_path=session_dir)
+    )
+    session_id = response["session_id"]
+
+    title = args.prompt_title or "prompt"
+    plt.rcParams["axes.titlesize"] = 12
+    plt.rcParams["figure.titlesize"] = 12
+
+    # Use the live-preview popup so the user sees the mask overlay while editing.
+    state = collect_prompts_with_live_preview(
+        predictor,
+        session_id,
+        frame_idx=0,
+        frame_for_prompt=frame_for_prompt,
+        initial_text=initial_text,
+        initial_points=initial_points,
+        initial_labels=initial_labels,
+        initial_box=initial_box,
+        title=title,
+    )
+    save_prompt_to_file(
+        args.prompt_file,
+        state["text"],
+        state["points"],
+        state["labels"],
+        state["box"],
+    )
+
+
 def main(args):
-    video_path = args.video_path 
-    out_path = args.out_path 
+    # Prompt-only mode: skip model + full-video loading, just grab the first frame.
+    if args.prompt_only:
+        if args.prompt_file is None:
+            raise ValueError("--prompt_only requires --prompt_file to save the collected prompt.")
+        _run_prompt_only(args)
+        return
+
+    video_path = args.video_path
+    out_path = args.out_path
 
 
     # TODO if there is no .mp4 file, convert all the image files to a mp4 file
@@ -544,7 +842,7 @@ def main(args):
 
     checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
     predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
-    
+
 
     # font size for axes titles
     plt.rcParams["axes.titlesize"] = 12
@@ -577,7 +875,7 @@ def main(args):
             video_frames_for_vis.sort()
 
     expected_mask_paths = get_mask_output_paths(video_frames_for_vis, out_path)
-    if expected_mask_paths and all(p.exists() for p in expected_mask_paths):
+    if not args.prompt_only and expected_mask_paths and all(p.exists() for p in expected_mask_paths):
         print(f"Masks already exist in {out_path}, skipping {video_path}")
         return
 
@@ -590,6 +888,8 @@ def main(args):
     session_id = response["session_id"]
 
     frame_idx = 0
+
+    # Start from CLI-provided prompts
     prompt_text_str = args.text_prompt
     if prompt_text_str is not None and str(prompt_text_str).strip().lower() in {"", "none", "null"}:
         prompt_text_str = None
@@ -602,6 +902,16 @@ def main(args):
     prompt_box = None
     if args.box_coords is not None:
         prompt_box = [float(v) for v in args.box_coords]
+
+    # Override with saved prompt file when available (unless in prompt-only mode,
+    # in which case we always collect a fresh prompt interactively).
+    loaded_prompt = load_prompt_from_file(args.prompt_file) if not args.prompt_only else None
+    if loaded_prompt is not None:
+        print(f"Loaded prompt from {args.prompt_file}")
+        prompt_text_str = loaded_prompt["text"]
+        prompt_points = loaded_prompt["points"]
+        prompt_point_labels = loaded_prompt["labels"]
+        prompt_box = loaded_prompt["box"]
     frame_for_prompt = load_frame(video_frames_for_vis[frame_idx])
     img_h, img_w = frame_for_prompt.shape[:2]
 
@@ -624,6 +934,10 @@ def main(args):
         or out is None
         or len(out["out_obj_ids"]) == 0
     )
+    # When a prompt file was loaded successfully, skip the popup unless
+    # --check_mask_result asked for an interactive review.
+    if loaded_prompt is not None and not args.check_mask_result and out is not None and len(out["out_obj_ids"]) > 0:
+        need_prompt_popup = False
     final_text_prompt = prompt_text_str
     final_points = prompt_points
     final_point_labels = prompt_point_labels
@@ -662,6 +976,16 @@ def main(args):
     if out is None or len(out["out_obj_ids"]) == 0:
         print("Skipping the video because no valid prompt mask was confirmed.")
         return
+
+    # Persist the prompt so a follow-up process can reuse it.
+    if args.prompt_file is not None:
+        save_prompt_to_file(
+            args.prompt_file,
+            final_text_prompt,
+            final_points,
+            final_point_labels,
+            final_box,
+        )
     if args.show_detected_obj:
         visualize_formatted_frame_output(
             frame_idx,
@@ -710,6 +1034,23 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="If 1, always show the interactive prompt window to verify/edit the first-frame mask.",
+    )
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default=None,
+        help="Path to a JSON file storing (and/or caching) the first-frame prompt.",
+    )
+    parser.add_argument(
+        "--prompt_only",
+        action="store_true",
+        help="Collect/confirm the prompt and save it to --prompt_file, then exit without running propagation.",
+    )
+    parser.add_argument(
+        "--prompt_title",
+        type=str,
+        default=None,
+        help="Title shown on the prompt popup in --prompt_only mode (e.g. 'hand_mask' / 'object_mask').",
     )
 
     args = parser.parse_args()
