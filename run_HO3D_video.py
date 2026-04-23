@@ -520,6 +520,13 @@ def collect_prompts_with_live_preview(
     suspend_text_callback = [False]
 
     fig, ax = plt.subplots()
+    # Set the OS-level window title (shows in title bar / taskbar),
+    # independent of the in-plot axes title set below.
+    if title:
+        try:
+            fig.canvas.manager.set_window_title(str(title))
+        except Exception:
+            pass
     ax.imshow(frame_for_prompt)
     mask_artist = ax.imshow(np.zeros((img_h, img_w), dtype=np.float32), cmap="jet", alpha=0.0)
     status_text = ax.text(
@@ -740,11 +747,81 @@ def _make_single_frame_session_dir(first_path):
 
 
 def _run_prompt_only(args):
-    """--prompt_only: load only the first image, spin up a lightweight SAM3
-    session on just that frame so the popup can show the live mask preview,
-    save the prompt, and exit without running propagation."""
-    first_path = _first_frame_path(args.video_path)
+    """--prompt_only: load SAM3 predictor ONCE, then for every (video, prompt_file)
+    pair pop up a live-preview window so the user can click / confirm / re-save
+    the first-frame prompt. Idempotent: existing prompt_file pre-fills the popup.
+    """
+    video_paths = list(args.video_path)
+    prompt_files = list(args.prompt_file) if args.prompt_file else []
+    if len(prompt_files) != len(video_paths):
+        raise ValueError(
+            f"--prompt_file count ({len(prompt_files)}) must match --video_path count ({len(video_paths)})"
+        )
 
+    def _broadcast(xs, n, name):
+        if xs is None:
+            return [None] * n
+        xs = list(xs)
+        if len(xs) == 1 and n > 1:
+            return xs * n
+        if len(xs) != n:
+            raise ValueError(f"--{name} has {len(xs)} values; expected 1 or {n}")
+        return xs
+
+    titles = _broadcast(args.prompt_title, len(video_paths), "prompt_title")
+    text_prompts = _broadcast(args.text_prompt, len(video_paths), "text_prompt")
+
+    print(f"[prompt_only] loading SAM3 predictor (once) for {len(video_paths)} video(s)...")
+    predictor = _build_predictor()
+    print("[prompt_only] predictor ready.")
+
+    for i, (vp, pf, title, tp) in enumerate(zip(video_paths, prompt_files, titles, text_prompts)):
+        print(f"\n[prompt_only {i+1}/{len(video_paths)}] video={vp}  file={pf}")
+        try:
+            _prompt_collect_with_predictor(
+                predictor,
+                video_path=vp,
+                prompt_file=pf,
+                text_prompt=tp,
+                point_coords=args.point_coords,
+                point_labels=args.point_labels,
+                box_coords=args.box_coords,
+                title=title,
+            )
+        except KeyboardInterrupt:
+            # Propagate Ctrl+C up so the script (and shell) can abort, instead of
+            # silently skipping to the next video.
+            print(f"[prompt_only] interrupted at {i+1}/{len(video_paths)}, aborting.")
+            raise
+        except Exception as e:
+            print(f"[prompt_only {i+1}/{len(video_paths)}] FAILED: {type(e).__name__}: {e}")
+
+
+def _build_predictor():
+    """Load the SAM3 video predictor once. Returns the predictor instance."""
+    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "../")
+    gpus_to_use = range(torch.cuda.device_count())
+    checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
+    return build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
+
+
+def _prompt_collect_with_predictor(
+    predictor,
+    video_path,
+    prompt_file,
+    text_prompt=None,
+    point_coords=None,
+    point_labels=None,
+    box_coords=None,
+    title=None,
+):
+    """Prompt-only collection for one video, reusing a shared predictor.
+
+    Idempotent: if prompt_file already exists, the popup opens with the saved
+    text/points/box pre-filled (so the user can just hit Enter to keep them,
+    or edit and re-save).
+    """
+    first_path = _first_frame_path(video_path)
     if first_path.endswith(".mp4"):
         cap = cv2.VideoCapture(first_path)
         ok, frame = cap.read()
@@ -752,7 +829,6 @@ def _run_prompt_only(args):
         if not ok:
             raise RuntimeError(f"Could not read first frame from {first_path}")
         frame_for_prompt = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Save the first frame to a temp image so the SAM3 session can load it.
         import tempfile
         tmp_dir = tempfile.mkdtemp(prefix="sam3_prompt_only_")
         first_img_path = Path(tmp_dir) / "0000.jpg"
@@ -762,21 +838,20 @@ def _run_prompt_only(args):
         frame_for_prompt = load_frame(first_path)
         session_dir = _make_single_frame_session_dir(first_path)
 
-    initial_text = args.text_prompt
+    initial_text = text_prompt
     if initial_text is not None and str(initial_text).strip().lower() in {"", "none", "null"}:
         initial_text = None
     initial_points = []
     initial_labels = []
-    if args.point_coords is not None or args.point_labels is not None:
-        if args.point_coords is None or args.point_labels is None:
-            raise ValueError("Please provide both --point_coords and --point_labels together.")
-        initial_points, initial_labels = parse_points(args.point_coords, args.point_labels)
-    initial_box = [float(v) for v in args.box_coords] if args.box_coords is not None else None
+    if point_coords or point_labels:
+        if point_coords is None or point_labels is None:
+            raise ValueError("Please provide both point_coords and point_labels together.")
+        initial_points, initial_labels = parse_points(point_coords, point_labels)
+    initial_box = [float(v) for v in box_coords] if box_coords is not None else None
 
-    # Override with an existing prompt file when available.
-    loaded_prompt = load_prompt_from_file(args.prompt_file)
+    loaded_prompt = load_prompt_from_file(prompt_file)
     if loaded_prompt is not None:
-        print(f"Loaded prompt from {args.prompt_file}")
+        print(f"Loaded prompt from {prompt_file}")
         initial_text = loaded_prompt["text"] if loaded_prompt["text"] is not None else initial_text
         if loaded_prompt["points"]:
             initial_points = loaded_prompt["points"]
@@ -784,21 +859,14 @@ def _run_prompt_only(args):
         if loaded_prompt["box"] is not None:
             initial_box = loaded_prompt["box"]
 
-    # Build the SAM3 predictor and start a session on the single-frame dir.
-    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "../")
-    checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
-    gpus_to_use = range(torch.cuda.device_count())
-    predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
     response = predictor.handle_request(
         request=dict(type="start_session", resource_path=session_dir)
     )
     session_id = response["session_id"]
 
-    title = args.prompt_title or "prompt"
     plt.rcParams["axes.titlesize"] = 12
     plt.rcParams["figure.titlesize"] = 12
 
-    # Use the live-preview popup so the user sees the mask overlay while editing.
     state = collect_prompts_with_live_preview(
         predictor,
         session_id,
@@ -808,10 +876,10 @@ def _run_prompt_only(args):
         initial_points=initial_points,
         initial_labels=initial_labels,
         initial_box=initial_box,
-        title=title,
+        title=title or "prompt",
     )
     save_prompt_to_file(
-        args.prompt_file,
+        prompt_file,
         state["text"],
         state["points"],
         state["labels"],
@@ -819,35 +887,23 @@ def _run_prompt_only(args):
     )
 
 
-def main(args):
-    # Prompt-only mode: skip model + full-video loading, just grab the first frame.
-    if args.prompt_only:
-        if args.prompt_file is None:
-            raise ValueError("--prompt_only requires --prompt_file to save the collected prompt.")
-        _run_prompt_only(args)
-        return
-
-    video_path = args.video_path
-    out_path = args.out_path
-
-
-    # TODO if there is no .mp4 file, convert all the image files to a mp4 file
-    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "../")
-
-    # use all available GPUs on the machine
-    gpus_to_use = range(torch.cuda.device_count())
-    # # use only a single GPU
-    # gpus_to_use = [torch.cuda.current_device()]
-
-
-    checkpoint_path = f"{sam3_root}/sam3/model/checkpoints/sam3.pt"
-    predictor = build_sam3_video_predictor(gpus_to_use=gpus_to_use, checkpoint_path=checkpoint_path)
-
-
+def _process_session(
+    predictor,
+    video_path,
+    out_path,
+    prompt_file=None,
+    text_prompt=None,
+    point_coords=None,
+    point_labels=None,
+    box_coords=None,
+    check_mask_result=0,
+    show_detected_obj=0,
+):
+    """Run SAM3 on one video with the given prompts/prompt_file. Extracted from
+    main() so --batch_file can reuse the same predictor across many items."""
     # font size for axes titles
     plt.rcParams["axes.titlesize"] = 12
     plt.rcParams["figure.titlesize"] = 12
-
 
     # load "video_frames_for_vis" for visualization purposes (they are not used by the model)
     if isinstance(video_path, str) and video_path.endswith(".mp4"):
@@ -875,7 +931,7 @@ def main(args):
             video_frames_for_vis.sort()
 
     expected_mask_paths = get_mask_output_paths(video_frames_for_vis, out_path)
-    if not args.prompt_only and expected_mask_paths and all(p.exists() for p in expected_mask_paths):
+    if expected_mask_paths and all(p.exists() for p in expected_mask_paths):
         print(f"Masks already exist in {out_path}, skipping {video_path}")
         return
 
@@ -890,24 +946,24 @@ def main(args):
     frame_idx = 0
 
     # Start from CLI-provided prompts
-    prompt_text_str = args.text_prompt
+    prompt_text_str = text_prompt
     if prompt_text_str is not None and str(prompt_text_str).strip().lower() in {"", "none", "null"}:
         prompt_text_str = None
     prompt_points = []
     prompt_point_labels = []
-    if args.point_coords is not None or args.point_labels is not None:
-        if args.point_coords is None or args.point_labels is None:
+    if point_coords is not None or point_labels is not None:
+        if point_coords is None or point_labels is None:
             raise ValueError("Please provide both --point_coords and --point_labels together.")
-        prompt_points, prompt_point_labels = parse_points(args.point_coords, args.point_labels)
+        prompt_points, prompt_point_labels = parse_points(point_coords, point_labels)
     prompt_box = None
-    if args.box_coords is not None:
-        prompt_box = [float(v) for v in args.box_coords]
+    if box_coords is not None:
+        prompt_box = [float(v) for v in box_coords]
 
     # Override with saved prompt file when available (unless in prompt-only mode,
     # in which case we always collect a fresh prompt interactively).
-    loaded_prompt = load_prompt_from_file(args.prompt_file) if not args.prompt_only else None
+    loaded_prompt = load_prompt_from_file(prompt_file)
     if loaded_prompt is not None:
-        print(f"Loaded prompt from {args.prompt_file}")
+        print(f"Loaded prompt from {prompt_file}")
         prompt_text_str = loaded_prompt["text"]
         prompt_points = loaded_prompt["points"]
         prompt_point_labels = loaded_prompt["labels"]
@@ -930,13 +986,13 @@ def main(args):
         )
 
     need_prompt_popup = (
-        bool(args.check_mask_result)
+        bool(check_mask_result)
         or out is None
         or len(out["out_obj_ids"]) == 0
     )
     # When a prompt file was loaded successfully, skip the popup unless
     # --check_mask_result asked for an interactive review.
-    if loaded_prompt is not None and not args.check_mask_result and out is not None and len(out["out_obj_ids"]) > 0:
+    if loaded_prompt is not None and not check_mask_result and out is not None and len(out["out_obj_ids"]) > 0:
         need_prompt_popup = False
     final_text_prompt = prompt_text_str
     final_points = prompt_points
@@ -978,15 +1034,15 @@ def main(args):
         return
 
     # Persist the prompt so a follow-up process can reuse it.
-    if args.prompt_file is not None:
+    if prompt_file is not None:
         save_prompt_to_file(
-            args.prompt_file,
+            prompt_file,
             final_text_prompt,
             final_points,
             final_point_labels,
             final_box,
         )
-    if args.show_detected_obj:
+    if show_detected_obj:
         visualize_formatted_frame_output(
             frame_idx,
             video_frames_for_vis,
@@ -1013,12 +1069,129 @@ def main(args):
     print(f"Saved extracted masks to: {Path(out_path).resolve()}")
 
 
+def _run_batch(batch_file):
+    """Load predictor ONCE and iterate through a list of items from batch_file.
+
+    batch_file is a JSON list of dicts, each with keys:
+      video_path (str, required)
+      out_path (str, required)
+      prompt_file (str, optional — load/save prompts here; interactive popup if missing)
+      text_prompt (str, optional)
+      point_coords (list[float], optional — flat x,y,x,y,...)
+      point_labels (list[int], optional)
+      box_coords (list[float,4], optional)
+      check_mask_result (int, optional — default 0; 1 forces interactive review)
+      show_detected_obj (int, optional)
+
+    Model weights are loaded once; each item calls _process_session with the
+    shared predictor, so wall time drops dramatically for many-seq runs.
+    """
+    with open(batch_file, "r") as f:
+        items = json.load(f)
+    if not isinstance(items, list) or not items:
+        print(f"[batch] empty or malformed batch_file: {batch_file}")
+        return
+
+    print(f"[batch] loading SAM3 predictor (once) for {len(items)} item(s)...")
+    predictor = _build_predictor()
+    print("[batch] predictor ready.")
+
+    for i, item in enumerate(items):
+        vp = item.get("video_path")
+        if not vp:
+            print(f"[batch {i+1}/{len(items)}] skipping: missing video_path")
+            continue
+        # prompt-only items collect a single prompt per video, no propagation
+        if item.get("prompt_only"):
+            pf = item.get("prompt_file")
+            if not pf:
+                print(f"[batch {i+1}/{len(items)}] prompt_only but no prompt_file, skipping")
+                continue
+            print(f"\n[batch {i+1}/{len(items)}] prompt_only video={vp}  file={pf}")
+            try:
+                _prompt_collect_with_predictor(
+                    predictor,
+                    video_path=vp,
+                    prompt_file=pf,
+                    text_prompt=item.get("text_prompt"),
+                    point_coords=item.get("point_coords"),
+                    point_labels=item.get("point_labels"),
+                    box_coords=item.get("box_coords"),
+                    title=item.get("title"),
+                )
+            except KeyboardInterrupt:
+                print(f"[batch] interrupted at {i+1}/{len(items)}, aborting.")
+                raise
+            except Exception as e:
+                print(f"[batch {i+1}/{len(items)}] FAILED: {type(e).__name__}: {e}")
+            continue
+        # full inference item
+        op = item.get("out_path")
+        if not op:
+            print(f"[batch {i+1}/{len(items)}] skipping: missing out_path for full inference")
+            continue
+        print(f"\n[batch {i+1}/{len(items)}] video={vp}  out={op}")
+        try:
+            _process_session(
+                predictor,
+                video_path=vp,
+                out_path=op,
+                prompt_file=item.get("prompt_file"),
+                text_prompt=item.get("text_prompt"),
+                point_coords=item.get("point_coords"),
+                point_labels=item.get("point_labels"),
+                box_coords=item.get("box_coords"),
+                check_mask_result=int(item.get("check_mask_result", 0)),
+                show_detected_obj=int(item.get("show_detected_obj", 0)),
+            )
+        except Exception as e:
+            print(f"[batch {i+1}/{len(items)}] FAILED: {type(e).__name__}: {e}")
+    print(f"\n[batch] done ({len(items)} items)")
+
+
+def main(args):
+    # Prompt-only mode: skip model + full-video loading, just grab the first frame.
+    if args.prompt_only:
+        if args.prompt_file is None:
+            raise ValueError("--prompt_only requires --prompt_file to save the collected prompt.")
+        _run_prompt_only(args)
+        return
+
+    # Batch mode: single predictor, multiple videos.
+    if getattr(args, "batch_file", None):
+        _run_batch(args.batch_file)
+        return
+
+    # Single-item mode: build predictor + run once.
+    # --video_path / --prompt_file / --text_prompt are nargs="+", unwrap to scalars.
+    if len(args.video_path) != 1:
+        raise ValueError("Single-item inference mode requires exactly one --video_path (got "
+                         f"{len(args.video_path)}). Use --batch_file for multi-video inference.")
+    _scalar = lambda xs: xs[0] if xs else None
+    predictor = _build_predictor()
+    _process_session(
+        predictor,
+        video_path=args.video_path[0],
+        out_path=args.out_path,
+        prompt_file=_scalar(args.prompt_file),
+        text_prompt=_scalar(args.text_prompt),
+        point_coords=args.point_coords,
+        point_labels=args.point_labels,
+        box_coords=args.box_coords,
+        check_mask_result=args.check_mask_result,
+        show_detected_obj=args.show_detected_obj,
+    )
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video_path", type=str, default="/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/rgb/")
+    parser.add_argument("--video_path", type=str, nargs="+",
+                        default=["/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/rgb/"],
+                        help="One or more video paths. In --prompt_only mode, paired with --prompt_file and --prompt_title.")
     parser.add_argument("--out_path", type=str, default="/home/simba/Documents/dataset/BundleSDF/HO3D_v3/train/ABF10/mask_hand/")
-    parser.add_argument("--text_prompt", type=str, default=None)
+    parser.add_argument("--text_prompt", type=str, nargs="+", default=None,
+                        help="Text prompt(s). Pass one (broadcast to all videos) or one per --video_path.")
     parser.add_argument("--point_coords", type=float, nargs="*", default=None,
                         help="Point coordinates as x1 y1 x2 y2 ... (pixel coords on frame 0).")
     parser.add_argument("--point_labels", type=int, nargs="*", default=None,
@@ -1038,19 +1211,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt_file",
         type=str,
+        nargs="+",
         default=None,
-        help="Path to a JSON file storing (and/or caching) the first-frame prompt.",
+        help="Prompt JSON file(s). In --prompt_only mode, pass one per --video_path (paired by index).",
     )
     parser.add_argument(
         "--prompt_only",
         action="store_true",
-        help="Collect/confirm the prompt and save it to --prompt_file, then exit without running propagation.",
+        help="Collect/confirm prompts and save to --prompt_file(s), load SAM3 predictor ONCE across all --video_path entries, then exit without propagation.",
     )
     parser.add_argument(
         "--prompt_title",
         type=str,
+        nargs="+",
         default=None,
-        help="Title shown on the prompt popup in --prompt_only mode (e.g. 'hand_mask' / 'object_mask').",
+        help="Popup title(s) in --prompt_only mode. Pass one (shared) or one per --video_path.",
+    )
+    parser.add_argument(
+        "--batch_file",
+        type=str,
+        default=None,
+        help="Path to a JSON list of items (video_path, out_path, prompt_file, text_prompt, ...). "
+             "Builds the SAM3 predictor once and iterates items — saves ~(N-1)*model_load.",
     )
 
     args = parser.parse_args()
