@@ -21,22 +21,26 @@ from matplotlib.patches import Rectangle
 from matplotlib.widgets import TextBox
 
 
-def save_prompt_to_file(prompt_file, text, points, labels, box):
-    """Persist a (text, points, labels, box) prompt bundle as JSON."""
+def save_prompt_to_file(prompt_file, text, points, labels, box, frame_idx=0):
+    """Persist a (text, points, labels, box) prompt bundle as JSON.
+    frame_idx is the user-facing frame number the prompt was drawn on
+    (the downstream pipeline will add_prompt + propagate from that frame)."""
     data = {
         "text": text if text is not None else "",
         "points": [[float(x), float(y)] for x, y in (points or [])],
         "labels": [int(v) for v in (labels or [])],
         "box": None if box is None else [float(v) for v in box],
+        "frame_idx": int(frame_idx),
     }
     Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
     with open(prompt_file, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"Saved prompt to {prompt_file}")
+    print(f"Saved prompt to {prompt_file} (frame_idx={frame_idx})")
 
 
 def load_prompt_from_file(prompt_file):
-    """Load a prompt JSON saved by ``save_prompt_to_file``. Returns a dict or None."""
+    """Load a prompt JSON saved by ``save_prompt_to_file``. Returns a dict or None.
+    frame_idx defaults to 0 when missing, preserving behavior for old prompts."""
     if prompt_file is None or not os.path.exists(prompt_file):
         return None
     with open(prompt_file, "r") as f:
@@ -49,6 +53,7 @@ def load_prompt_from_file(prompt_file):
         "points": [[float(x), float(y)] for x, y in data.get("points", [])],
         "labels": [int(v) for v in data.get("labels", [])],
         "box": data.get("box"),
+        "frame_idx": int(data.get("frame_idx", 0)),
     }
 
 
@@ -699,6 +704,15 @@ def collect_prompts_with_live_preview(
             state["text"] = text_box.text.strip()
             # Ensure latest prompt state is committed before closing the popup.
             _refresh_preview()
+            # Require at least one positive point. A bbox-only or text-only
+            # prompt propagates poorly through a long video (symptom: downstream
+            # SAM3D gets empty mask_object — see .note/30 round 1). Reject here
+            # so the annotator cannot accidentally save such a prompt.
+            pos_count = sum(1 for v in state["labels"] if int(v) == 1)
+            if pos_count == 0:
+                _set_status("Need >=1 LEFT-click (positive point) before Enter.")
+                fig.canvas.draw_idle()
+                return
             plt.close(fig)
 
     fig.canvas.mpl_connect("button_press_event", _on_press)
@@ -716,7 +730,17 @@ def collect_prompts_with_live_preview(
 
 
 def _first_frame_path(video_path):
-    """Return the path to the first image frame under ``video_path`` (or the mp4 itself)."""
+    """Path to the first image frame under ``video_path`` (legacy helper)."""
+    return _frame_path_at(video_path, 0)
+
+
+def _frame_path_at(video_path, frame_idx):
+    """Path to the ``frame_idx``-th image frame under ``video_path``.
+
+    For .mp4 inputs the path is the mp4 itself (the caller is expected to
+    seek inside). For image dirs, frames are sorted numerically when names
+    look like integers.
+    """
     if isinstance(video_path, str) and video_path.endswith(".mp4"):
         return video_path
     frames = glob.glob(os.path.join(video_path, "*.jpg"))
@@ -726,7 +750,11 @@ def _first_frame_path(video_path):
         frames.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
     except ValueError:
         frames.sort()
-    return frames[0]
+    if frame_idx < 0 or frame_idx >= len(frames):
+        raise IndexError(
+            f"frame_idx={frame_idx} out of range; {video_path} has {len(frames)} frames"
+        )
+    return frames[frame_idx]
 
 
 def _make_single_frame_session_dir(first_path):
@@ -770,13 +798,20 @@ def _run_prompt_only(args):
 
     titles = _broadcast(args.prompt_title, len(video_paths), "prompt_title")
     text_prompts = _broadcast(args.text_prompt, len(video_paths), "text_prompt")
+    # frame_idx is a list of ints (nargs='+'); broadcast 1 -> N or require N.
+    frame_idxs = _broadcast(
+        [int(v) for v in args.frame_idx] if args.frame_idx else [0],
+        len(video_paths), "frame_idx",
+    )
 
     print(f"[prompt_only] loading SAM3 predictor (once) for {len(video_paths)} video(s)...")
     predictor = _build_predictor()
     print("[prompt_only] predictor ready.")
 
-    for i, (vp, pf, title, tp) in enumerate(zip(video_paths, prompt_files, titles, text_prompts)):
-        print(f"\n[prompt_only {i+1}/{len(video_paths)}] video={vp}  file={pf}")
+    for i, (vp, pf, title, tp, fidx) in enumerate(
+        zip(video_paths, prompt_files, titles, text_prompts, frame_idxs)
+    ):
+        print(f"\n[prompt_only {i+1}/{len(video_paths)}] video={vp}  file={pf}  frame_idx={fidx}")
         try:
             _prompt_collect_with_predictor(
                 predictor,
@@ -787,6 +822,7 @@ def _run_prompt_only(args):
                 point_labels=args.point_labels,
                 box_coords=args.box_coords,
                 title=title,
+                frame_idx=fidx,
             )
         except KeyboardInterrupt:
             # Propagate Ctrl+C up so the script (and shell) can abort, instead of
@@ -814,29 +850,36 @@ def _prompt_collect_with_predictor(
     point_labels=None,
     box_coords=None,
     title=None,
+    frame_idx=0,
 ):
     """Prompt-only collection for one video, reusing a shared predictor.
 
-    Idempotent: if prompt_file already exists, the popup opens with the saved
-    text/points/box pre-filled (so the user can just hit Enter to keep them,
-    or edit and re-save).
+    ``frame_idx`` selects which frame of the video to annotate. A session is
+    started on a single-frame dir containing only that frame (SAM3 sees it
+    as frame 0 internally), but the saved JSON records the real ``frame_idx``
+    so the downstream pipeline can add_prompt on the matching real frame
+    before propagate_in_video.
+
+    Idempotent: if ``prompt_file`` already exists, its saved state pre-fills
+    the popup (so the user can hit Enter to keep, or edit and re-save).
     """
-    first_path = _first_frame_path(video_path)
-    if first_path.endswith(".mp4"):
-        cap = cv2.VideoCapture(first_path)
+    target_path = _frame_path_at(video_path, frame_idx)
+    if target_path.endswith(".mp4"):
+        cap = cv2.VideoCapture(target_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = cap.read()
         cap.release()
         if not ok:
-            raise RuntimeError(f"Could not read first frame from {first_path}")
+            raise RuntimeError(f"Could not read frame {frame_idx} from {target_path}")
         frame_for_prompt = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         import tempfile
         tmp_dir = tempfile.mkdtemp(prefix="sam3_prompt_only_")
-        first_img_path = Path(tmp_dir) / "0000.jpg"
-        Image.fromarray(frame_for_prompt).save(first_img_path)
+        only_img_path = Path(tmp_dir) / "0000.jpg"
+        Image.fromarray(frame_for_prompt).save(only_img_path)
         session_dir = tmp_dir
     else:
-        frame_for_prompt = load_frame(first_path)
-        session_dir = _make_single_frame_session_dir(first_path)
+        frame_for_prompt = load_frame(target_path)
+        session_dir = _make_single_frame_session_dir(target_path)
 
     initial_text = text_prompt
     if initial_text is not None and str(initial_text).strip().lower() in {"", "none", "null"}:
@@ -851,7 +894,7 @@ def _prompt_collect_with_predictor(
 
     loaded_prompt = load_prompt_from_file(prompt_file)
     if loaded_prompt is not None:
-        print(f"Loaded prompt from {prompt_file}")
+        print(f"Loaded prompt from {prompt_file} (saved frame_idx={loaded_prompt['frame_idx']})")
         initial_text = loaded_prompt["text"] if loaded_prompt["text"] is not None else initial_text
         if loaded_prompt["points"]:
             initial_points = loaded_prompt["points"]
@@ -867,16 +910,17 @@ def _prompt_collect_with_predictor(
     plt.rcParams["axes.titlesize"] = 12
     plt.rcParams["figure.titlesize"] = 12
 
+    popup_title = (title or "prompt") + (f" (frame {frame_idx})" if frame_idx != 0 else "")
     state = collect_prompts_with_live_preview(
         predictor,
         session_id,
-        frame_idx=0,
+        frame_idx=0,  # SAM3 session contains only the one frame we loaded
         frame_for_prompt=frame_for_prompt,
         initial_text=initial_text,
         initial_points=initial_points,
         initial_labels=initial_labels,
         initial_box=initial_box,
-        title=title or "prompt",
+        title=popup_title,
     )
     save_prompt_to_file(
         prompt_file,
@@ -884,6 +928,7 @@ def _prompt_collect_with_predictor(
         state["points"],
         state["labels"],
         state["box"],
+        frame_idx=frame_idx,
     )
 
 
@@ -898,6 +943,7 @@ def _process_session(
     box_coords=None,
     check_mask_result=0,
     show_detected_obj=0,
+    frame_idx=0,
 ):
     """Run SAM3 on one video with the given prompts/prompt_file. Extracted from
     main() so --batch_file can reuse the same predictor across many items."""
@@ -943,7 +989,9 @@ def _process_session(
     )
     session_id = response["session_id"]
 
-    frame_idx = 0
+    # frame_idx: seed frame for add_prompt + start of propagate_in_video.
+    # Callers pass CLI --frame_idx; load_prompt_from_file may override it
+    # below so that re-runs use the frame the annotator actually marked on.
 
     # Start from CLI-provided prompts
     prompt_text_str = text_prompt
@@ -963,11 +1011,18 @@ def _process_session(
     # in which case we always collect a fresh prompt interactively).
     loaded_prompt = load_prompt_from_file(prompt_file)
     if loaded_prompt is not None:
-        print(f"Loaded prompt from {prompt_file}")
+        print(f"Loaded prompt from {prompt_file} (saved frame_idx={loaded_prompt['frame_idx']})")
         prompt_text_str = loaded_prompt["text"]
         prompt_points = loaded_prompt["points"]
         prompt_point_labels = loaded_prompt["labels"]
         prompt_box = loaded_prompt["box"]
+        # Prompt was drawn on a specific frame — use the same frame here so the
+        # mask drawn in the popup is what propagate_in_video seeds from.
+        frame_idx = loaded_prompt["frame_idx"]
+    if frame_idx < 0 or frame_idx >= len(video_frames_for_vis):
+        raise IndexError(
+            f"frame_idx={frame_idx} out of range; video has {len(video_frames_for_vis)} frames"
+        )
     frame_for_prompt = load_frame(video_frames_for_vis[frame_idx])
     img_h, img_w = frame_for_prompt.shape[:2]
 
@@ -1041,6 +1096,7 @@ def _process_session(
             final_points,
             final_point_labels,
             final_box,
+            frame_idx=frame_idx,
         )
     if show_detected_obj:
         visualize_formatted_frame_output(
@@ -1143,6 +1199,7 @@ def _run_batch(batch_file):
                 box_coords=item.get("box_coords"),
                 check_mask_result=int(item.get("check_mask_result", 0)),
                 show_detected_obj=int(item.get("show_detected_obj", 0)),
+                frame_idx=int(item.get("frame_idx", 0)),
             )
         except Exception as e:
             print(f"[batch {i+1}/{len(items)}] FAILED: {type(e).__name__}: {e}")
@@ -1180,6 +1237,7 @@ def main(args):
         box_coords=args.box_coords,
         check_mask_result=args.check_mask_result,
         show_detected_obj=args.show_detected_obj,
+        frame_idx=(args.frame_idx[0] if args.frame_idx else 0),
     )
 
 
@@ -1226,6 +1284,15 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         help="Popup title(s) in --prompt_only mode. Pass one (shared) or one per --video_path.",
+    )
+    parser.add_argument(
+        "--frame_idx",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Frame index to annotate (0-based). Single value broadcasts to all "
+             "--video_path entries; pass one per video for independent control. "
+             "Saved into the prompt JSON so downstream pipeline picks up the same frame.",
     )
     parser.add_argument(
         "--batch_file",
